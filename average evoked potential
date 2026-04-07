@@ -1,0 +1,449 @@
+import numpy as np
+from scipy.signal import butter, filtfilt, find_peaks
+import matplotlib.pyplot as plt
+from radiens import VidereClient
+
+# THE REAL GOLDEN PATH
+full_path = r"C:\Users\axr1940\radix\data\allego_1__uid0331-10-58-20.xdat"
+
+def main():
+    print("Connecting to Videre and loading data...")
+    vc = VidereClient()
+    
+    # 1. LOAD THE METADATA
+    meta = vc.link_data_file(full_path)
+    print("Data successfully linked! The bouncer let us in!")
+
+    # 2. PULL THE SIGNALS SEPARATELY (No more "all"!)
+    print("Asking the bartender for brain waves (amp)...")
+    brain_sigs = vc.signals().get_signals(
+        dataset_metadata=meta,
+        sig_type="amp",  
+        ntv_idxs="all"
+    )
+    
+    print("Asking the bartender for digital beeps (gpio_dout)...")
+    beep_sigs = vc.signals().get_signals(
+        dataset_metadata=meta,
+        sig_type="dout",  
+        ntv_idxs="all"
+    )
+    print("All data successfully loaded into memory!")
+    # 3. SET UP THE SLICER PARAMETERS
+    sampling_rate = 30000 
+    pre_samples = int(0.050 * sampling_rate)   # 50 ms before 
+    post_samples = int(0.150 * sampling_rate)  # 150 ms after 
+
+    # 4. GRAB THE DIGITAL BEEPS (DO 1)
+    digital_out = beep_sigs.signals.gpio_dout[0] 
+    
+    # Find where the beep goes from 0 to 1
+    trigger_samples = np.where(np.diff(digital_out) > 0)[0] 
+    print(f"Success: I found {len(trigger_samples)} beeps in the file!")
+
+    # 5. SLICE THE BRAIN WAVES (Electrode 1)
+    brain_data_ch1 = brain_sigs.signals.amp[0] 
+    all_slices = [] 
+
+    for beep_index in trigger_samples:
+        start_point = beep_index - pre_samples
+        end_point = beep_index + post_samples
+        
+        # Keep slices that fit perfectly inside the recording time
+        if start_point > 0 and end_point < len(brain_data_ch1):
+            one_slice = brain_data_ch1[start_point : end_point]
+            all_slices.append(one_slice)
+
+    print(f"Successfully created {len(all_slices)} epochs (slices) of data!")
+# --- THE VICTORY LAP: PLOTTING THE DATA ---
+    print("Crunching the numbers and drawing the graph...")
+    
+    # 1. Average all 10 slices together to find the clear signal
+    average_brain_wave = np.mean(all_slices, axis=0)
+
+    # 2. Create a time axis in milliseconds (-50ms to +150ms)
+    time_axis = np.linspace(-50, 150, len(average_brain_wave))
+
+    # 3. Draw the graph!
+    plt.figure(figsize=(10, 5)) # Make it nice and wide
+    plt.plot(time_axis, average_brain_wave, color='blue', linewidth=2)
+    
+    # Draw a red dashed line exactly where the beep happened (Time = 0)
+    plt.axvline(x=0, color='red', linestyle='--', label='Stimulus (Beep)') 
+    
+    plt.title("Brain's Average Reaction to the Beep (ERP)")
+    plt.xlabel("Time (milliseconds)")
+    plt.ylabel("Voltage")
+    plt.legend()
+    plt.grid(True, alpha=0.3) # Adds a faint grid for readability
+    
+    # This command physically pops the window open on your screen
+    plt.show()
+    # --- STEP 2: THE FFT (FREQUENCY ANALYSIS) ---
+    print("Calculating the FFT to find the carrier frequency...")
+    
+    # 1. Run the FFT math on our averaged brain wave
+    fft_values = np.fft.fft(average_brain_wave)
+    
+    # 2. Figure out the X-axis (the actual frequencies in Hz)
+    n_samples = len(average_brain_wave)
+    frequencies = np.fft.fftfreq(n_samples, d=1/sampling_rate)
+    
+    # 3. We only care about the positive frequencies (the first half)
+    half_n = n_samples // 2
+    pos_frequencies = frequencies[:half_n]
+    pos_fft_values = np.abs(fft_values[:half_n]) # Get the power/magnitude
+    
+    # 4. Draw the FFT Graph!
+    plt.figure(figsize=(10, 5))
+    plt.plot(pos_frequencies, pos_fft_values, color='purple', linewidth=1.5)
+    
+    plt.title("FFT: What frequencies are hiding in the brain wave?")
+    plt.xlabel("Frequency (Hz)")
+    plt.ylabel("Magnitude (Power)")
+    
+    # Let's zoom in on the 0 to 5000 Hz range (Change 5000 if your beep was higher pitch!)
+    plt.xlim(0, 5000) 
+    plt.grid(True, alpha=0.3)
+    
+    plt.show()
+
+    # =======================================================
+    # --- LEVEL 3: PAPER-REPLICATED SPIKE EXTRACTION ---
+    # =======================================================
+    print("Designing the Bandpass Filter (100 - 3000 Hz)...")
+
+    # 1. Update filter to match the paper (100 to 3000 Hz)
+    nyq = 0.5 * sampling_rate
+    low_cut = 100 / nyq
+    high_cut = 3000 / nyq
+    b, a = butter(4, [low_cut, high_cut], btype='bandpass')
+
+    print("Filtering data...")
+    filtered_spikes = filtfilt(b, a, brain_data_ch1)
+
+    # 2. Calculate the Dynamic Threshold (1.5x Standard Deviation)
+    # We calculate the SD of the whole filtered signal to find the baseline noise
+    noise_sd = np.std(filtered_spikes)
+    
+    # Action potentials usually shoot downwards first, so our threshold is negative
+    spike_threshold = -1.5 * noise_sd 
+    print(f"Calculated 1.5x SD Threshold: {spike_threshold:.2f} uV")
+
+    # 3. Find the Spikes!
+    # We flip the signal negative (-) so the "valleys" become "peaks" for the algorithm to find.
+    # The 'distance' parameter ensures we don't count a single wide spike twice (e.g., locking out for 1 ms)
+    lockout_ms = int(0.001 * sampling_rate) 
+    spike_indices, _ = find_peaks(-filtered_spikes, height=-spike_threshold, distance=lockout_ms)
+    
+    print(f"SUCCESS: Found {len(spike_indices)} total spikes in the recording!")
+
+    # 4. Plotting a snippet to verify
+    start_idx = int(1.0 * sampling_rate)
+    end_idx = int(1.1 * sampling_rate)
+    
+    # Find which spikes specifically live inside our 100ms viewing window
+    spikes_in_window = [s for s in spike_indices if start_idx <= s < end_idx]
+    
+    time_snippet = np.linspace(0, 100, end_idx - start_idx)
+    filt_snippet = filtered_spikes[start_idx:end_idx]
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(time_snippet, filt_snippet, color='black', linewidth=1, label="Filtered Data (100-3000 Hz)")
+    plt.axhline(spike_threshold, color='red', linestyle='--', label=f'Threshold (1.5x SD = {spike_threshold:.1f})')
+    
+    # Put a distinct dot exactly where the computer detected a spike
+    for spike_idx in spikes_in_window:
+        # Calculate where on our 100ms X-axis this spike belongs
+        spike_time_ms = ((spike_idx - start_idx) / sampling_rate) * 1000
+        plt.plot(spike_time_ms, filtered_spikes[spike_idx], 'ro') # 'ro' means Red Circle
+
+    plt.title("Automated Spike Detection (Paper Methodology)")
+    plt.xlabel("Time (milliseconds)")
+    plt.ylabel("Voltage")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+# =======================================================
+    # --- LEVEL 4: THE REAL PERI-STIMULUS TIME HISTOGRAM ---
+    # =======================================================
+    print("Building the REAL PSTH using your actual triggers...")
+
+    # 1. Convert everything from 'samples' to 'milliseconds'
+    spike_times_ms = (spike_indices / sampling_rate) * 1000
+    trigger_times_ms = (trigger_samples / sampling_rate) * 1000
+    
+    print(f"Aligning {len(spike_times_ms)} spikes to {len(trigger_times_ms)} real stimulus events...")
+
+    # 2. Set our window (How much time around the beep do we care about?)
+    pre_stim_ms = 10   # Look 50ms before the beep
+    post_stim_ms = 60 # Look 200ms after the beep
+    bin_size_ms = 1    # Group spikes into 5ms "buckets" for the bar chart
+
+    # 3. Align the Spikes!
+    aligned_spikes = []
+    raster_y_coords = []
+    raster_x_coords = []
+
+    # Loop through every single time the speaker fired
+    for trial_number, trigger_time in enumerate(trigger_times_ms):
+        
+        # Define the absolute start and end time for this specific trial's window
+        window_start = trigger_time - pre_stim_ms
+        window_end = trigger_time + post_stim_ms
+        
+        # Find all spikes that happened inside this window
+        spikes_in_window = [s for s in spike_times_ms if window_start <= s <= window_end]
+        
+        # Align them so the trigger is exactly at Time = 0
+        for spike_time in spikes_in_window:
+            relative_time = spike_time - trigger_time
+            aligned_spikes.append(relative_time)
+            
+            # Save coordinates for the Raster Plot
+            raster_x_coords.append(relative_time)
+            raster_y_coords.append(trial_number + 1)
+
+    # 4. Draw the Publication-Ready Figure (Raster + PSTH)
+    fig, (ax_raster, ax_psth) = plt.subplots(2, 1, figsize=(10, 8), sharex=True, gridspec_kw={'height_ratios': [1, 2]})
+
+    # Top Graph: Raster Plot (Every dot is a single spike across trials)
+    ax_raster.scatter(raster_x_coords, raster_y_coords, color='black', s=10, marker='|')
+    ax_raster.axvline(0, color='red', linestyle='--', linewidth=1)
+    ax_raster.set_title("Real Neural Firing Aligned to IHS Stimulus")
+    ax_raster.set_ylabel("Trial Number")
+    
+    # Bottom Graph: The PSTH (Bar chart of total spikes)
+    # We only draw the histogram if we actually caught some spikes!
+    if len(aligned_spikes) > 0:
+        bins = np.arange(-pre_stim_ms, post_stim_ms + bin_size_ms, bin_size_ms)
+        ax_psth.hist(aligned_spikes, bins=bins, color='gray', edgecolor='black')
+    else:
+        print("Warning: No spikes found in the time windows around your triggers!")
+        
+    ax_psth.axvline(0, color='red', linestyle='--', linewidth=2, label="Stimulus Onset (DIO1)")
+    
+    ax_psth.set_xlabel("Time from Stimulus (milliseconds)")
+    ax_psth.set_ylabel("Total Spike Count")
+    ax_psth.legend()
+    
+    plt.tight_layout()
+    plt.show()
+
+    # =======================================================
+    # --- LEVEL 5: THE SPIKE WAVEFORM (What the PI wants!) ---
+    # =======================================================
+    print("Extracting spike waveforms to show the PI...")
+
+    # We want to look at a tiny 3-millisecond window around every spike
+    # (-1 ms before the peak, +2 ms after the peak)
+    waveform_window_pre = int(0.001 * sampling_rate)  
+    waveform_window_post = int(0.002 * sampling_rate) 
+    
+    waveforms = []
+    
+    # Grab the actual voltage shape for every spike we found
+    for idx in spike_indices:
+        # Make sure the spike isn't too close to the very beginning or end of the file
+        if idx - waveform_window_pre > 0 and idx + waveform_window_post < len(filtered_spikes):
+            wave_snippet = filtered_spikes[idx - waveform_window_pre : idx + waveform_window_post]
+            waveforms.append(wave_snippet)
+            
+    waveforms = np.array(waveforms)
+    print(f"Extracted {len(waveforms)} valid spike waveforms!")
+
+    # Draw the Spike Waveforms!
+    plt.figure(figsize=(6, 5))
+    
+    # Create the tiny time axis (-1ms to +2ms)
+    time_ms = np.linspace(-1, 2, waveform_window_pre + waveform_window_post)
+    
+    # Plotting all 7,000 lines would crash your computer, so we randomly pick 100 to draw
+    sample_size = min(100, len(waveforms))
+    random_indices = np.random.choice(len(waveforms), sample_size, replace=False)
+    
+    for i in random_indices:
+        plt.plot(time_ms, waveforms[i], color='gray', alpha=0.3, linewidth=0.5)
+        
+    # Plot the AVERAGE spike shape on top in thick red (This is the golden ticket!)
+    average_waveform = np.mean(waveforms, axis=0)
+    plt.plot(time_ms, average_waveform, color='red', linewidth=3, label="Average Spike Waveform")
+    
+    plt.title("The Spike Waveform (Proof it's a real neuron!)")
+    plt.xlabel("Time (milliseconds)")
+    plt.ylabel("Voltage (uV)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    # =======================================================
+    # --- LEVEL 6: STIMULUS-LOCKED VOLTAGE TRACE ---
+    # =======================================================
+    print("Extracting a continuous trace around the stimulus...")
+
+    # Let's look at the VERY FIRST beep (Trial 0)
+    # You can change this index to 1, 2, 3, etc., to look at different beeps!
+    trial_to_plot = 0 
+    first_beep_sample = trigger_samples[trial_to_plot]
+
+    # Set our window: 100ms before to 100ms after
+    window_pre_samples = int(0.100 * sampling_rate)
+    window_post_samples = int(0.300 * sampling_rate)
+
+    start_idx = first_beep_sample - window_pre_samples
+    end_idx = first_beep_sample + window_post_samples
+
+    # Grab the continuous filtered voltage for this window
+    trace_snippet = filtered_spikes[start_idx:end_idx]
+
+    # Create the time axis (-100ms to +100ms)
+    time_trace_ms = np.linspace(-100, 300, len(trace_snippet))
+
+    # Find which spikes specifically live inside this exact window
+    spikes_in_trace = [s for s in spike_indices if start_idx <= s < end_idx]
+
+  # --- Draw the Plot! ---
+    plt.figure(figsize=(12, 5))
+    
+    # Plot the continuous voltage line
+    plt.plot(time_trace_ms, trace_snippet, color='black', linewidth=1, label="Filtered Voltage")
+    
+    # --- NEW: SHOWING THE "DURING" PHASE ---
+    # Put the actual length of your beep here (in milliseconds)! 
+    # I am guessing 50ms for now, but change it to match your IHS settings.
+    stimulus_duration_ms = 200 
+    
+    # Shade the entire "During" region in light blue
+    plt.axvspan(0, stimulus_duration_ms, color='blue', alpha=0.1, label="During Stimulus")
+    
+    # Draw a line for the Start (Onset) and the End (Offset)
+    plt.axvline(0, color='blue', linestyle='--', linewidth=2, label="Stimulus Start")
+    plt.axvline(stimulus_duration_ms, color='blue', linestyle=':', linewidth=2, label="Stimulus End")
+    
+    # Draw the threshold line so they can see the "Bouncer" at work
+    plt.axhline(spike_threshold, color='green', linestyle=':', label="Detection Threshold")
+
+    # Put a red dot exactly where the computer detected a spike
+    for spike_idx in spikes_in_trace:
+        spike_time_ms = ((spike_idx - first_beep_sample) / sampling_rate) * 1000
+        plt.plot(spike_time_ms, filtered_spikes[spike_idx], 'ro', markersize=5) 
+
+    plt.title(f"Single Trial Trace (Trial {trial_to_plot + 1}): Before, During, and After")
+    plt.xlabel("Time from Stimulus Start (milliseconds)")
+    plt.ylabel("Voltage (uV)")
+    
+    # Moved the legend outside so it doesn't cover your data!
+    plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left") 
+    plt.grid(True, alpha=0.3)
+    plt.xlim(-100, 300)
+    plt.tight_layout()
+    plt.show()
+# =======================================================
+    # --- LEVEL 7: THE 400ms TRIAL-AVERAGED RESPONSE ---
+    # =======================================================
+    print("Calculating the average response across all trials...")
+
+    # Define our 400ms window (-100 to +300)
+    pre_stim_ms = 100
+    post_stim_ms = 300
+    bin_size_ms = 1  # 1ms bins for high resolution
+    stim_duration_ms = 200
+
+    all_aligned_spikes = []
+    
+    # Collect spikes from all 10 trials
+    for trigger_time in trigger_times_ms:
+        window_start = trigger_time - pre_stim_ms
+        window_end = trigger_time + post_stim_ms
+        
+        # Find spikes in this specific 400ms window
+        spikes_in_window = [s for s in spike_times_ms if window_start <= s <= window_end]
+        
+        for s in spikes_in_window:
+            all_aligned_spikes.append(s - trigger_time)
+
+    # --- Plotting the Average ---
+    plt.figure(figsize=(10, 6))
+    
+    if len(all_aligned_spikes) > 0:
+        bins = np.arange(-pre_stim_ms, post_stim_ms + bin_size_ms, bin_size_ms)
+        counts, bin_edges = np.histogram(all_aligned_spikes, bins=bins)
+        
+        # Convert counts to "Spikes per Second" (Hz) for a professional look
+        # (Counts / number of trials) / (bin size in seconds)
+        firing_rate = (counts / len(trigger_times_ms)) / (bin_size_ms / 1000)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        
+        # Plot the thick red line (The Average Response)
+        plt.plot(bin_centers, firing_rate, color='red', linewidth=2, label="Average Firing Rate")
+
+    # Add the "During Stimulus" shaded box (0 to 200ms)
+    plt.axvspan(0, stim_duration_ms, color='blue', alpha=0.1, label="200ms White Noise Burst")
+    
+    # Formatting to match the DCN papers
+    plt.axvline(0, color='black', linestyle='-')
+    plt.axvline(stim_duration_ms, color='black', linestyle='--')
+    plt.xlabel("Time relative to Stimulus (ms)")
+    plt.ylabel("Firing Rate (spikes/s)")
+    plt.title("Average Neural Response (n=10 trials)")
+    plt.xlim(-100, 300)
+    plt.legend()
+    plt.grid(True, alpha=0.2)
+    plt.show()
+    # =======================================================
+    # --- LEVEL 8: AVERAGE VOLTAGE TRACE (EVOKED POTENTIAL) ---
+    # =======================================================
+    print("Calculating the Trial-Averaged Voltage Trace...")
+
+    # We want 100ms before and 300ms after (to capture the 200ms stimulus + 100ms recovery)
+    window_pre_samples = int(0.100 * sampling_rate)
+    window_post_samples = int(0.300 * sampling_rate)
+    
+    all_traces = []
+
+    # Loop through all 10 beeps
+    for beep_sample in trigger_samples:
+        start_idx = beep_sample - window_pre_samples
+        end_idx = beep_sample + window_post_samples
+        
+        # Make sure we don't try to grab data past the end of the file
+        if start_idx >= 0 and end_idx < len(filtered_spikes):
+            # Grab the 400ms voltage snippet for this specific beep
+            trace_snippet = filtered_spikes[start_idx:end_idx]
+            all_traces.append(trace_snippet)
+
+    # Convert our list of traces into a math-friendly format
+    all_traces = np.array(all_traces)
+    
+    # Calculate the average amplitude across all 10 trials!
+    # (axis=0 means "average straight down the stack of trials")
+    average_trace = np.mean(all_traces, axis=0)
+
+    # Create the time axis (-100ms to +300ms)
+    time_trace_ms = np.linspace(-100, 300, len(average_trace))
+
+    # --- Draw the Plot! ---
+    plt.figure(figsize=(12, 5))
+    
+    # Plot the Average Trace
+    plt.plot(time_trace_ms, average_trace, color='purple', linewidth=1.5, label="Average Voltage Amplitude")
+    
+    # Add the "During Stimulus" shaded box (0 to 200ms)
+    stimulus_duration_ms = 200
+    plt.axvspan(0, stimulus_duration_ms, color='blue', alpha=0.1, label="200ms White Noise Burst")
+    
+    # Draw the boundary lines
+    plt.axvline(0, color='black', linestyle='--', linewidth=2)
+    plt.axvline(stimulus_duration_ms, color='black', linestyle=':', linewidth=2)
+
+    plt.title("Trial-Averaged Evoked Potential (Average Amplitude over 400ms)")
+    plt.xlabel("Time from Stimulus Start (milliseconds)")
+    plt.ylabel("Average Voltage Amplitude (uV)")
+    plt.xlim(-100, 300)
+    plt.legend(loc="upper right")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+if __name__ == "__main__":
+    main()
