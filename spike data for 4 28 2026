@@ -1,0 +1,131 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from radiens import VidereClient
+
+# 1. YOUR NEW FILE PATH (Update this to your actual file!)
+full_path = r"C:\Users\axr1940\radix\data\allego_3__uid0428-19-02-26.xdat"
+
+def rescue_data():
+    print("Connecting to Videre...")
+    vc = VidereClient()
+    
+    # Link the file
+    meta = vc.link_data_file(full_path)
+    sampling_rate = 30000 
+    
+    # 2. Define exactly where we want to look
+    search_start_sec = 1480 
+    search_end_sec = 1550   
+    
+    print(f"Asking the server for ONLY the data between {search_start_sec}s and {search_end_sec}s...")
+    
+    # 3. Tell Radiens to only give us a tiny time range, and only 1 channel!
+    brain_sigs = vc.signals().get_signals(
+        dataset_metadata=meta, 
+        sig_type="amp", 
+        ntv_idxs=[0], 
+        time_range=[search_start_sec, search_end_sec] 
+    )
+    
+    # Grab the 30-second chunk
+    chunk_data = brain_sigs.signals.amp[0]
+    
+    print("Data loaded successfully! Hunting for artifacts...")
+
+    # =======================================================
+    # --- ISOLATING THE ARTIFACTS ---
+    # =======================================================
+    
+    artifact_threshold = 400 # uV. Adjust if your artifacts are smaller/bigger.
+    
+    crossed_threshold = np.where(np.abs(chunk_data) > artifact_threshold)[0]
+    debounce_samples = int(0.100 * sampling_rate) 
+    
+    recovered_triggers_in_chunk = []
+    if len(crossed_threshold) > 0:
+        recovered_triggers_in_chunk.append(crossed_threshold[0])
+        
+        for i in range(1, len(crossed_threshold)):
+            if crossed_threshold[i] - recovered_triggers_in_chunk[-1] > debounce_samples:
+                recovered_triggers_in_chunk.append(crossed_threshold[i])
+                
+    recovered_triggers_in_chunk = np.array(recovered_triggers_in_chunk)
+    
+    print(f"SUCCESS: Recovered {len(recovered_triggers_in_chunk)} stimulus triggers from the analog trace!")
+    
+    # =======================================================
+    # --- PLOT TO VERIFY WE CAUGHT THEM ---
+    # =======================================================
+    time_chunk_sec = np.linspace(search_start_sec, search_end_sec, len(chunk_data))
+    
+    plt.figure(figsize=(12, 5))
+    plt.plot(time_chunk_sec, chunk_data, color='black', linewidth=0.5, label="Raw Brain Trace")
+    
+    plt.axhline(artifact_threshold, color='green', linestyle='--', label="Artifact Threshold")
+    plt.axhline(-artifact_threshold, color='green', linestyle='--')
+    
+    for trig in recovered_triggers_in_chunk:
+        trig_time_sec = search_start_sec + (trig / sampling_rate)
+        plt.plot(trig_time_sec, chunk_data[trig], 'ro', markersize=8)
+        
+    plt.title("Recovering Lost Stimulus Triggers from Electrical Artifacts")
+    plt.xlabel("Time in Recording (Seconds)")
+    plt.ylabel("Voltage (uV)")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.show()
+# =======================================================
+    # --- LEVEL 9: RECOVERED STIMULUS-LOCKED TRACE ---
+    # =======================================================
+    print("Generating Before/During/After plot for the first recovered stimulus...")
+
+    # Grab the very first trigger we rescued
+    first_pulse_idx = recovered_triggers_in_chunk[0]
+
+    # Let's look at 100ms before and 300ms after
+    window_pre_samples = int(0.100 * sampling_rate)
+    window_post_samples = int(0.300 * sampling_rate)
+
+    start_idx = first_pulse_idx - window_pre_samples
+    end_idx = first_pulse_idx + window_post_samples
+
+    # Make sure we don't accidentally grab data outside our 30-second chunk
+    if start_idx >= 0 and end_idx < len(chunk_data):
+        # Grab the 400ms voltage snippet
+        trace_snippet = chunk_data[start_idx:end_idx]
+
+        # Create the time axis (-100ms to +300ms)
+        time_trace_ms = np.linspace(-100, 300, len(trace_snippet))
+
+        # --- Draw the Plot! ---
+        plt.figure(figsize=(12, 5))
+        
+        # Plot the continuous voltage line
+        plt.plot(time_trace_ms, trace_snippet, color='black', linewidth=1, label="Raw Voltage")
+        
+        # --- SHOWING THE "DURING" PHASE ---
+        # Electrical pulses are fast! Put your actual pulse duration here. 
+        # I am putting 5ms as a guess for a hindlimb shock.
+        stimulus_duration_ms = 5 
+        
+        # Shade the "During" region in light blue
+        plt.axvspan(0, stimulus_duration_ms, color='blue', alpha=0.1, label="Electrical Stimulus")
+        
+        # Draw dashed lines for the Start and End
+        plt.axvline(0, color='blue', linestyle='--', linewidth=2)
+        plt.axvline(stimulus_duration_ms, color='blue', linestyle=':', linewidth=2)
+
+        plt.title("Single Trial Trace: Hindlimb Stimulation (Before, During, After)")
+        plt.xlabel("Time from Stimulus Start (milliseconds)")
+        plt.ylabel("Voltage (uV)")
+        
+        plt.legend(loc="upper right")
+        plt.grid(True, alpha=0.3)
+        plt.xlim(-100, 300)
+        plt.tight_layout()
+        plt.show()
+    else:
+        print("Oops! The first trigger is too close to the edge of the 30-second window to plot.")
+
+if __name__ == "__main__":
+    rescue_data()
