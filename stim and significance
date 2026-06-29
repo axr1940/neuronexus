@@ -1,0 +1,198 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import signal, stats
+from radiens import VidereClient
+
+# ==============================================================================
+# 1. CONFIGURATION
+# ==============================================================================
+full_path = r"C:\Users\axr1940\radix\data\allego_2__uid0604-13-16-35.xdat" 
+sampling_rate = 30000 
+
+channel_to_plot = 12  # Remember, this is Allego A/13!
+
+manual_threshold_uv = -100.0 
+
+# --- NEW TIMING VARIABLES ---
+latency_offset = 0.080    
+sound_duration = 0.200    
+plot_margin = 0.100       
+
+# 🌟 NEW: Define the globally silent period (in seconds)
+global_silence_start = 1.0  
+global_silence_end = 11.0   
+
+output_folder = rf"C:\Users\axr1940\Documents\ariana_vscode\neuronexus\yay\6-4-2026\Ch_{channel_to_plot:02d}_All_Trials"
+os.makedirs(output_folder, exist_ok=True)
+
+def generate_50_trial_figures():
+    print("🔌 [STEP 1] Connecting to Radiens and loading metadata...")
+    vc = VidereClient()
+    meta = vc.link_data_file(full_path)
+    
+    abs_start = 0.0
+    if hasattr(meta, 'time_range') and meta.time_range is not None:
+        try:
+            first_element = meta.time_range
+            while hasattr(first_element, '__len__') and not isinstance(first_element, (str, bytes)):
+                if len(first_element) > 0: first_element = first_element[0]
+                else: break
+            abs_start = float(first_element)
+        except Exception:
+            abs_start = 0.0
+
+    print("🎛️ [STEP 2] Extracting DO 1 toggles...")
+    dig_sigs = vc.signals().get_signals(dataset_metadata=meta, sig_type="dout", ntv_idxs=[0], time_range=None)
+    
+    dig_raw = None
+    for attr in dir(dig_sigs.signals):
+        if not attr.startswith('_'):
+            val = getattr(dig_sigs.signals, attr)
+            try:
+                arr = np.array(val).flatten()
+                if len(arr) > 1000:
+                    dig_raw = arr.astype(float)
+                    break
+            except Exception:
+                continue
+
+    v_min, v_max = np.min(dig_raw), np.max(dig_raw)
+    v_thresh = v_min + (v_max - v_min) / 2.0
+    binary_signal = (dig_raw > v_thresh).astype(int)
+    transitions = np.diff(binary_signal)
+    
+    rising_idxs = np.where(transitions == 1)[0] + 1
+    falling_idxs = np.where(transitions == -1)[0] + 1
+    
+    trigger_idxs = rising_idxs if len(rising_idxs) >= len(falling_idxs) else falling_idxs
+    trigger_times = abs_start + (trigger_idxs / sampling_rate)
+    
+    clean_triggers = []
+    if len(trigger_times) > 0:
+        clean_triggers.append(trigger_times[0])
+        for t in trigger_times[1:]:
+            if t - clean_triggers[-1] > 0.5:
+                clean_triggers.append(t)
+    
+    print(f"🎯 Found {len(clean_triggers)} sound presentations. Preparing 50 figures...")
+    if len(clean_triggers) == 0: return
+
+    print(f"🧠 [STEP 3] Loading raw data for Channel {channel_to_plot}...")
+    target_channels = list(range(16))
+    sigs = vc.signals().get_signals(dataset_metadata=meta, sig_type="amp", ntv_idxs=target_channels, time_range=None)
+    
+    nyquist = 0.5 * sampling_rate
+    b, a = signal.butter(4, [100/nyquist, 3000/nyquist], btype='band')
+    
+    try:
+        if isinstance(sigs.signals.amp, dict): raw_neural = np.array(sigs.signals.amp[channel_to_plot]).flatten()
+        else: raw_neural = np.array(sigs.signals.amp[channel_to_plot]).flatten()
+    except Exception as e:
+        print(f"❌ ERROR loading channel {channel_to_plot}: {e}")
+        return
+        
+    filtered = signal.filtfilt(b, a, raw_neural)
+    
+    # Calculate global spikes
+    spike_idxs = np.where(filtered < manual_threshold_uv)[0]
+    spike_times_abs = []
+    if len(spike_idxs) > 0:
+        last_s = -100
+        for s in spike_idxs:
+            if s - last_s > (0.0015 * sampling_rate):
+                spike_times_abs.append(abs_start + (s / sampling_rate))
+                last_s = s
+    spike_times_abs = np.array(spike_times_abs)
+    
+    print("🧮 [STEP 3.5] Calculating Global Statistics...")
+    # 🌟 NEW: Calculate Spontaneous Rates from the global silent period
+    spont_rates = []
+    silence_duration = global_silence_end - global_silence_start
+    num_chunks = int(silence_duration / sound_duration)
+    
+    for i in range(num_chunks):
+        chunk_start = (abs_start + global_silence_start) + (i * sound_duration)
+        chunk_end = chunk_start + sound_duration
+        spont_counts = np.sum((spike_times_abs >= chunk_start) & (spike_times_abs < chunk_end))
+        spont_rates.append(spont_counts / sound_duration)
+
+    # Calculate Sound Rates (same as before)
+    sound_rates = []
+    for t_trigger in clean_triggers:
+        sound_counts = np.sum((spike_times_abs >= (t_trigger + latency_offset)) & (spike_times_abs < (t_trigger + latency_offset + sound_duration)))
+        sound_rates.append(sound_counts / sound_duration)
+        
+    # 🌟 NEW: Independent t-test instead of paired, since baseline is now global
+    t_stat, p_val = stats.ttest_ind(spont_rates, sound_rates, equal_var=False)
+    if np.isnan(p_val): p_val = 1.0
+    
+    mean_spont, std_spont = np.mean(spont_rates), np.std(spont_rates)
+    mean_sound, std_sound = np.mean(sound_rates), np.std(sound_rates)
+
+    print("🎨 [STEP 4] Generating the 50 perfectly centered trial plots...")
+    
+    for trial_idx, trigger_time in enumerate(clean_triggers):
+        trial_num = trial_idx + 1
+        
+        plot_start_time = (trigger_time + latency_offset) - plot_margin
+        plot_end_time = (trigger_time + latency_offset + sound_duration) + plot_margin
+        
+        slice_start_idx = int(max(0, (plot_start_time - abs_start) * sampling_rate))
+        slice_end_idx = int((plot_end_time - abs_start) * sampling_rate)
+        time_axis = np.linspace(plot_start_time, plot_end_time, slice_end_idx - slice_start_idx)
+        voltage_slice = filtered[slice_start_idx:slice_end_idx]
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6), gridspec_kw={'width_ratios': [2.5, 1]})
+        fig.suptitle(f'Zoomed DCN Acoustic Response - Channel A/{channel_to_plot + 1}', fontsize=16, fontweight='bold') # Adjusted Title!
+        
+        # Left Panel
+        ax1.plot(time_axis, voltage_slice, color='black', linewidth=0.5)
+        ax1.axvline(x=trigger_time, color='green', linestyle=':', linewidth=2, label='DO1 Trigger Onset')
+        ax1.axvspan(trigger_time + latency_offset, trigger_time + latency_offset + sound_duration, color='cyan', alpha=0.3, label='Active Spike Window')
+        ax1.axhline(manual_threshold_uv, color='red', linestyle='--', linewidth=1, label=f'Threshold ({manual_threshold_uv} uV)')
+        
+        ax1.set_title(f'Single Presentation Window (Trial {trial_num})', fontsize=12)
+        ax1.set_xlabel('Time (Seconds)', fontsize=10)
+        ax1.set_ylabel('Voltage (uV)', fontsize=10)
+        ax1.set_xlim(plot_start_time, plot_end_time)
+        ax1.legend(loc='upper right', fontsize=9)
+        
+        # Right Panel
+        bars = ax2.bar([0, 1], [mean_spont, mean_sound], yerr=[std_spont, std_sound], capsize=8, 
+                       color=['#E8E8E8', '#42F5F5'], edgecolor='black', width=0.8)
+        
+        ax2.set_title('Mean Firing Rate Comparison', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Spike Firing Rate (Hz)', fontsize=10)
+        ax2.set_xticks([0, 1])
+        ax2.set_xticklabels(['Global Spontaneous', 'During Sound'])
+        ax2.grid(axis='y', linestyle='--', alpha=0.5)
+        
+        y_max = max(mean_spont + std_spont, mean_sound + std_sound)
+        ax2.set_ylim(0, y_max + (y_max * 0.25)) 
+        
+        bracket_h = y_max + (y_max * 0.05)
+        tick_h = bracket_h - (y_max * 0.02)
+        ax2.plot([0, 0, 1, 1], [tick_h, bracket_h, bracket_h, tick_h], lw=1.5, color='black')
+        
+        if p_val < 0.0001:
+            p_text = "★ p < 0.0001"
+        else:
+            p_text = f"★ p = {p_val:.4f}"
+            
+        color = 'red' if p_val < 0.05 else 'black'
+        ax2.text(0.5, bracket_h + (y_max * 0.02), p_text, ha='center', va='bottom', color=color, fontweight='bold', fontsize=12)
+
+        plt.tight_layout()
+        
+        save_path = os.path.join(output_folder, f"Ch_{channel_to_plot:02d}_Trial_{trial_num:02d}.png")
+        plt.savefig(save_path, dpi=300)
+        plt.close(fig) 
+        
+        if trial_num % 10 == 0:
+            print(f"   ✓ Processed {trial_num}/50 trials...")
+
+    print(f"🎉 DONE! All 50 trials for Channel A/{channel_to_plot + 1} have been saved to:\n{output_folder}")
+
+if __name__ == "__main__":
+    generate_50_trial_figures()
